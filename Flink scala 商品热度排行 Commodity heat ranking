@@ -1,0 +1,123 @@
+
+import java.lang
+import java.sql.Timestamp
+
+import scala.collection.JavaConversions._
+import org.apache.flink.api.common.functions.AggregateFunction
+import org.apache.flink.api.common.state.{ListState, ListStateDescriptor}
+import org.apache.flink.api.java.tuple.{Tuple, Tuple1}
+import org.apache.flink.configuration.Configuration
+import org.apache.flink.streaming.api.TimeCharacteristic
+import org.apache.flink.streaming.api.functions
+import org.apache.flink.streaming.api.functions.KeyedProcessFunction
+import org.apache.flink.streaming.api.scala._
+import org.apache.flink.streaming.api.scala.function.WindowFunction
+import org.apache.flink.streaming.api.windowing.time.Time
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow
+import org.apache.flink.util.Collector
+
+import scala.collection.mutable.ListBuffer
+
+
+// 定义输入样类
+case class UserBehavior(useId:Long, itemId: Long, categoryId : Int , behavior : String, timesp: Long)
+//  定义窗口聚合结果样例类
+case class ItemViewCount(itemId:Long,windowEnd:Long,count: Long)
+
+object HotItem {
+  def main(args: Array[String]): Unit = {
+    //环境
+    val env = StreamExecutionEnvironment.getExecutionEnvironment
+    env.setParallelism(1)
+    env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime)
+
+    // 读取文件  处理类型
+    val inputStream :DataStream[String]= env.readTextFile("C:\\Users\\AKAck\\IdeaProjects\\UserBehavior\\HotItemAnalysis\\src\\main\\resources\\UserBehavior.csv")
+    val dataStream = inputStream
+      .map(data => {
+        val arry = data.split(",")
+        UserBehavior(arry(0).toLong,arry(1).toLong,arry(2).toInt,arry(3),arry(4).toLong)
+      })
+      .assignAscendingTimestamps(_.timesp * 1000L)
+
+    // 得到窗口聚合结果
+    val aggStream  = dataStream
+      .filter(_.behavior == "pv")  // 过滤pv
+        .keyBy("itemId")
+        .timeWindow(Time.hours(1),Time.minutes(5))  // 滑动窗口 1小时  间隔五分钟
+        .aggregate(new CountAgg(), new WindowResult())  // 调用预聚合，传给窗口做值  增量的聚合
+      // 定义窗口规则     定义输出结构 ItemViewCount(itemId,windowEnd,count)
+        .keyBy(1)   // 按照窗口进行分组，收集当前窗口内的商品count数据
+        .process(new TopnItems(5))  // 自定义处理流程
+        .print()
+
+    env.execute()
+  }
+}
+
+//  预聚合   <IN, ACC, OUT>   统计窗口中的条数，即遇到一条数据就加一。
+class CountAgg() extends AggregateFunction[UserBehavior,Long,Long]{
+  // 聚合状态就是当前商品的count值
+  override def createAccumulator(): Long = 0L
+  // 每来一条数据，调用一次add，count就加一
+  override def add(in: UserBehavior, acc: Long): Long = acc + 1
+  override def getResult(acc: Long): Long = acc
+  override def merge(acc: Long, acc1: Long): Long = acc + acc1
+}
+
+// 自定义窗口函数    <IN, OUT, KEY, W extends Window>   IN 对应预聚合里的out  out是输出类型 . key是keyby对应的类型
+// 将每个key每个窗口对应的结果封装成itemviewcount进行输出
+class WindowResult() extends WindowFunction[Long,ItemViewCount,Tuple,TimeWindow]{
+  override def apply(key: Tuple, window: TimeWindow, input: Iterable[Long], out: Collector[ItemViewCount]): Unit = {
+    val itemId = key.asInstanceOf[Tuple1[Long]].f0   //  key就是商品编号
+    val windowEnd = window.getEnd         // 获取窗口末尾
+    val count = input.iterator.next()    // 获取累加大小
+    out.collect(ItemViewCount(itemId,windowEnd,count))   // 将获得的值进行上传
+  }
+}
+
+// 自定义keyprocessfunction
+class TopnItems(topSize: Int) extends KeyedProcessFunction[Tuple,ItemViewCount,String]{
+  // 先定义状态：ListState   保存所有的itemviewcount
+  private var itemViewCountListState : ListState[ItemViewCount] = _
+
+  override def open(parameters: Configuration): Unit = {
+    itemViewCountListState = getRuntimeContext.getListState(new ListStateDescriptor[ItemViewCount]("itemViewCountList",classOf[ItemViewCount]))
+  }   // 初始化状态变量
+  override def processElement(i: ItemViewCount, context: KeyedProcessFunction[Tuple, ItemViewCount, String]#Context, collector: Collector[String]): Unit = {
+    // 每来一条数据，直接加入liststate
+    itemViewCountListState.add(i)
+    // 注册一个定时器  windowEnd + 1  延迟触发
+    context.timerService().registerEventTimeTimer(i.windowEnd + 1)
+  }
+
+
+  // 当定时器触发，可以认为所有窗口统计结果到齐，可以排序输出
+  override def onTimer(timestamp: Long, ctx: KeyedProcessFunction[Tuple, ItemViewCount, String]#OnTimerContext, out: Collector[String]): Unit = {
+    // 为了方便排序，另外定义一个listbuffer，保存liststate里面的所有数据
+    val AllItemViewCount: ListBuffer[ItemViewCount] = ListBuffer()
+    val iter = itemViewCountListState.get().iterator()
+    while (iter.hasNext) {
+      AllItemViewCount += iter.next()
+    }
+    // 清空状态
+    itemViewCountListState.clear()
+    // 按照count大小排序，取前n个  倒叙 隐式函数
+    val sortedItemViewCount = AllItemViewCount.sortBy(_.count)(Ordering.Long.reverse).take(topSize)
+    // 可视化  格式化string
+    val result: StringBuilder = new StringBuilder
+    result.append("窗口结束时间：").append(new Timestamp(timestamp - 1)).append("\n")
+
+    // 遍历结果列表中的每个itemviewcount，输出到一行
+    for (i <- sortedItemViewCount.indices) {
+      val currentItemViewCount = sortedItemViewCount(i)
+      result.append("NO").append(i + 1).append(": \t")
+        .append("商品id = ").append(currentItemViewCount.itemId).append("\t")
+        .append("热门度 = ").append(currentItemViewCount.count).append("\n")
+    }
+    result.append("===========================\n\n")
+
+    Thread.sleep(1000)
+    out.collect(result.toString())
+  }
+  }
